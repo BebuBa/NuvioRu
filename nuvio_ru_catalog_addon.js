@@ -1,19 +1,25 @@
 #!/usr/bin/env node
 /**
- * Nuvio RU Каталоги (Фильмы, Сериалы, Мультфильмы, Аниме)
- * Автономный аддон каталогов и метаданных для Nuvio и Stremio, адаптированный для работы в РФ без VPN.
+ * Nuvio RU Каталоги (TMDB RU + Кинопоиск + Shikimori) — версия с обходом блокировок TMDB в РФ
+ * Автономный аддон каталогов и метаданных для Nuvio и Stremio.
  *
- * Особенности:
- * - Полностью русский интерфейс (каталоги, жанры, описания, веб-конфигуратор /configure)
- * - Поддержка Kinopoisk Unofficial API (kinopoiskapiunofficial.tech — работает в РФ без VPN)
- * - Поддержка Shikimori API (shikimori.one — аниме-каталоги и поиск работают в РФ без ключа и без VPN)
- * - Автоматический маппинг ID в формат IMDb (tt...) и TMDB для совместимости со скраперами Nuvio
- * - Встроенный прокси постеров (/proxy/image), обходящий блокировки image.tmdb.org у провайдеров РФ
- * - Не требует внешних npm-пакетов (работает на стандартном Node.js 18+)
+ * Что умеет:
+ * 1. Полноценная работа с TMDB на русском языке (language=ru-RU) в России без VPN:
+ *    - Автоматический обход блокировки api.themoviedb.org через резервный официальный домен api.tmdb.org
+ *      или пользовательский прокси-сервер (а при запуске на Render/облаке запросы идут напрямую с зарубежного IP).
+ *    - Встроенный серверный прокси обложек (/proxy/image), который сам скачивает постеры с TMDB (image.tmdb.org)
+ *      и отдает их в Nuvio от лица вашего сервера (либо через незаблокированный CDN wsrv.nl).
+ *    - Отдает родные TMDB ID (tmdb:...) и IMDb ID (tt...), поэтому все локальные скраперы Nuvio работают идеально.
+ * 2. Готовые русские полки TMDB:
+ *    - Фильмы в тренде и Популярные фильмы (с фильтром по жанрам на русском)
+ *    - Сериалы в тренде и Хиты стримингов (Netflix, HBO Max, Apple TV+, Amazon Prime, Disney+)
+ *    - Мультфильмы и Мультсериалы (отдельно от японского аниме!)
+ *    - Аниме-сериалы и Аниме-фильмы (с русскими названиями, описаниями и списками серий из TMDB + Shikimori)
+ * 3. Также сохранена поддержка Kinopoisk Unofficial API и Shikimori API.
  *
  * Запуск:
  *   node nuvio_ru_catalog_addon.js
- * После запуска откройте в браузере:
+ * Настройка в браузере:
  *   http://127.0.0.1:7000/configure
  */
 
@@ -21,15 +27,52 @@ const http = require('http');
 const { URL } = require('url');
 
 const PORT = Number(process.env.PORT || 7000);
-const DEFAULT_KP_KEY = process.env.KP_API_KEY || '';
 const DEFAULT_TMDB_KEY = process.env.TMDB_API_KEY || '';
+const DEFAULT_KP_KEY = process.env.KP_API_KEY || '';
+const DEFAULT_TMDB_BASE = process.env.TMDB_API_BASE || '';
 
-// Жанры на русском языке для фильтрации в Nuvio
-const MOVIE_GENRES = [
-  'Боевик', 'Комедия', 'Фантастика', 'Триллер', 'Драма',
-  'Детектив', 'Приключения', 'Ужасы', 'Криминал', 'Мелодрама',
-  'Фэнтези', 'Военный', 'История', 'Биография', 'Семейный'
-];
+// Жанры на русском языке и их ID в TMDB
+const TMDB_MOVIE_GENRES = {
+  'Боевик': 28,
+  'Приключения': 12,
+  'Комедия': 35,
+  'Криминал': 80,
+  'Детектив': 9648,
+  'Драма': 18,
+  'Семейный': 10751,
+  'Фэнтези': 14,
+  'История': 36,
+  'Ужасы': 27,
+  'Мелодрама': 10749,
+  'Фантастика': 878,
+  'Триллер': 53,
+  'Военный': 10752
+};
+
+const TMDB_TV_GENRES = {
+  'Боевик и Приключения': 10759,
+  'Комедия': 35,
+  'Криминал': 80,
+  'Детектив': 9648,
+  'Драма': 18,
+  'Семейный': 10751,
+  'Фантастика и Фэнтези': 10765,
+  'Война и Политика': 10768,
+  'Вестерн': 37
+};
+
+const STREAMING_NETWORKS = {
+  'Netflix': 213,
+  'HBO / Max': 49,
+  'Apple TV+': 2552,
+  'Amazon Prime Video': 1024,
+  'Disney+': 2739,
+  'Hulu': 453
+};
+
+const MOVIE_GENRE_LIST = Object.keys(TMDB_MOVIE_GENRES);
+const TV_GENRE_LIST = Object.keys(TMDB_TV_GENRES);
+const NETWORK_LIST = Object.keys(STREAMING_NETWORKS);
 
 const ANIME_GENRES = [
   'Экшен', 'Приключения', 'Комедия', 'Драма', 'Фэнтези',
@@ -37,246 +80,116 @@ const ANIME_GENRES = [
   'Психологическое', 'Повседневность', 'Сёнэн', 'Сэйнэн', 'Детектив'
 ];
 
-// Сопоставление русских названий жанров с ID жанров Kinopoisk Unofficial API
 const KP_GENRE_IDS = {
-  'триллер': 1,
-  'драма': 2,
-  'криминал': 3,
-  'мелодрама': 4,
-  'детектив': 5,
-  'фантастика': 6,
-  'приключения': 7,
-  'биография': 8,
-  'боевик': 11,
-  'фэнтези': 12,
-  'комедия': 13,
-  'военный': 14,
-  'история': 15,
-  'ужасы': 17,
-  'мультфильм': 18,
-  'семейный': 19
+  'триллер': 1, 'драма': 2, 'криминал': 3, 'мелодрама': 4, 'детектив': 5,
+  'фантастика': 6, 'приключения': 7, 'боевик': 11, 'фэнтези': 12,
+  'комедия': 13, 'военный': 14, 'история': 15, 'ужасы': 17, 'мультфильм': 18, 'семейный': 19
 };
 
-// Сопоставление жанров Shikimori
 const SHIKI_GENRE_IDS = {
-  'экшен': 1,
-  'приключения': 2,
-  'комедия': 4,
-  'драма': 8,
-  'фэнтези': 10,
-  'романтика': 22,
-  'фантастика': 24,
-  'повседневность': 36,
-  'сверхъестественное': 37,
-  'психологическое': 40,
-  'триллер': 41,
-  'сёнэн': 27,
-  'сэйнэн': 42,
-  'детектив': 7
+  'экшен': 1, 'приключения': 2, 'комедия': 4, 'драма': 8, 'фэнтези': 10,
+  'романтика': 22, 'фантастика': 24, 'повседневность': 36, 'сверхъестественное': 37,
+  'психологическое': 40, 'триллер': 41, 'сёнэн': 27, 'сэйнэн': 42, 'детектив': 7
 };
 
-// Встроенный резервный каталог популярных тайтлов с реальными IMDb ID (на случай, если API-ключ Кинопоиска еще не указан)
+// Резервный каталог с реальными IMDb и TMDB ID (работает даже до ввода ключей)
 const FALLBACK_CATALOG = {
   movies: [
     {
-      id: 'tt0816692',
-      imdb_id: 'tt0816692',
-      type: 'movie',
-      name: 'Интерстеллар',
-      releaseInfo: '2014',
-      imdbRating: '8.7',
+      id: 'tt0816692', imdb_id: 'tt0816692', tmdbId: '157336', type: 'movie',
+      name: 'Интерстеллар', releaseInfo: '2014', imdbRating: '8.7',
       genres: ['Фантастика', 'Драма', 'Приключения'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/258687.jpg',
-      description: 'Когда засуха, пыльные бури и вымирание растений приводят человечество к продовольственному кризису, коллектив исследователей и учёных отправляется сквозь червоточину в путешествие, чтобы превзойти прежние ограничения для космических путешествий человека.'
+      description: 'Когда засуха, пыльные бури и вымирание растений приводят человечество к продовольственному кризису, коллектив исследователей и учёных отправляется сквозь червоточину в путешествие.'
     },
     {
-      id: 'tt8367814',
-      imdb_id: 'tt8367814',
-      type: 'movie',
-      name: 'Джентльмены',
-      releaseInfo: '2019',
-      imdbRating: '7.8',
+      id: 'tt8367814', imdb_id: 'tt8367814', tmdbId: '522627', type: 'movie',
+      name: 'Джентльмены', releaseInfo: '2019', imdbRating: '7.8',
       genres: ['Криминал', 'Комедия', 'Боевик'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/1143242.jpg',
-      description: 'Один ушлый американец ещё со студенческих лет приторговывал наркотиками, а теперь придумал схему нелегального обогащения с использованием поместий обедневшей английской аристократии.'
+      description: 'Талантливый выпускник Оксфорда придумал схему нелегального обогащения с использованием поместий обедневшей английской аристократии.'
     },
     {
-      id: 'tt15239678',
-      imdb_id: 'tt15239678',
-      type: 'movie',
-      name: 'Дюна: Часть вторая',
-      releaseInfo: '2024',
-      imdbRating: '8.5',
+      id: 'tt15239678', imdb_id: 'tt15239678', tmdbId: '693134', type: 'movie',
+      name: 'Дюна: Часть вторая', releaseInfo: '2024', imdbRating: '8.5',
       genres: ['Фантастика', 'Боевик', 'Драма'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/4540126.jpg',
       description: 'Герцог Пол Атрейдес присоединяется к фрименам, чтобы стать Муад’Дибом, одновременно пытаясь остановить наступление войны.'
     },
     {
-      id: 'tt15398776',
-      imdb_id: 'tt15398776',
-      type: 'movie',
-      name: 'Оппенгеймер',
-      releaseInfo: '2023',
-      imdbRating: '8.3',
-      genres: ['Биография', 'Драма', 'История'],
+      id: 'tt15398776', imdb_id: 'tt15398776', tmdbId: '872585', type: 'movie',
+      name: 'Оппенгеймер', releaseInfo: '2023', imdbRating: '8.3',
+      genres: ['История', 'Драма'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/4664634.jpg',
       description: 'История жизни американского физика-теоретика Роберта Оппенгеймера, который во времена Второй мировой войны руководил Манхэттенским проектом.'
-    },
-    {
-      id: 'tt0111161',
-      imdb_id: 'tt0111161',
-      type: 'movie',
-      name: 'Побег из Шоушенка',
-      releaseInfo: '1994',
-      imdbRating: '9.3',
-      genres: ['Драма'],
-      poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/326.jpg',
-      description: 'Бухгалтер Энди Дюфрейн обвинён в убийстве собственной жены и её любовника. Оказавшись в тюрьме под названием Шоушенк, он сталкивается с жестокостью и беззаконием.'
-    },
-    {
-      id: 'tt0120737',
-      imdb_id: 'tt0120737',
-      type: 'movie',
-      name: 'Властелин колец: Братство Кольца',
-      releaseInfo: '2001',
-      imdbRating: '8.9',
-      genres: ['Фэнтези', 'Приключения', 'Драма'],
-      poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/328.jpg',
-      description: 'Сказания о Средиземье — это хроника Великой войны за Кольцо, длившейся не одну тысячу лет.'
     }
   ],
   series: [
     {
-      id: 'tt0903747',
-      imdb_id: 'tt0903747',
-      type: 'series',
-      name: 'Во все тяжкие',
-      releaseInfo: '2008–2013',
-      imdbRating: '9.5',
+      id: 'tt0903747', imdb_id: 'tt0903747', tmdbId: '1396', type: 'series',
+      name: 'Во все тяжкие', releaseInfo: '2008–2013', imdbRating: '9.5',
       genres: ['Криминал', 'Драма', 'Триллер'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/404900.jpg',
-      description: 'Школьный учитель химии Уолтер Уайт узнаёт, что болен раком лёгких. Чтобы обеспечить финансовое будущее своей семьи, он начинает производить метамфетамин.'
+      description: 'Школьный учитель химии Уолтер Уайт узнаёт, что болен раком лёгких, и начинает производить метамфетамин ради будущего семьи.'
     },
     {
-      id: 'tt0944947',
-      imdb_id: 'tt0944947',
-      type: 'series',
-      name: 'Игра престолов',
-      releaseInfo: '2011–2019',
-      imdbRating: '9.2',
-      genres: ['Фэнтези', 'Драма', 'Боевик'],
-      poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/464963.jpg',
-      description: 'К концу подходит время благоденствия, и лето, длившееся почти десятилетие, угасает. Вокруг средоточия власти Семи королевств, Железного трона, зреет заговор.'
-    },
-    {
-      id: 'tt12637874',
-      imdb_id: 'tt12637874',
-      type: 'series',
-      name: 'Фоллаут',
-      releaseInfo: '2024–...',
-      imdbRating: '8.4',
-      genres: ['Фантастика', 'Боевик', 'Драма'],
+      id: 'tt12637874', imdb_id: 'tt12637874', tmdbId: '106379', type: 'series',
+      name: 'Фоллаут', releaseInfo: '2024', imdbRating: '8.4',
+      genres: ['Фантастика', 'Боевик и Приключения', 'Драма'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/1392550.jpg',
-      description: 'Через 200 лет после ядерного апокалипсиса обитательница уютного убежища вынуждена выйти на поверхность, где её ждёт опасный и безумный мир пустоши.'
+      description: 'Через 200 лет после ядерного апокалипсиса обитательница уютного убежища вынуждена выйти на поверхность.'
     },
     {
-      id: 'tt11280740',
-      imdb_id: 'tt11280740',
-      type: 'series',
-      name: 'Разделение',
-      releaseInfo: '2022–...',
-      imdbRating: '8.7',
-      genres: ['Фантастика', 'Триллер', 'Драма'],
+      id: 'tt11280740', imdb_id: 'tt11280740', tmdbId: '95396', type: 'series',
+      name: 'Разделение', releaseInfo: '2022', imdbRating: '8.7',
+      genres: ['Фантастика и Фэнтези', 'Драма', 'Детектив'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/1343318.jpg',
-      description: 'Руководство компании Lumon Industries придумало новый способ контролировать повседневную деятельность своих сотрудников — процедуру «разделения» рабочих и личных воспоминаний.'
+      description: 'Руководство компании Lumon Industries придумало процедуру «разделения» рабочих и личных воспоминаний сотрудников.'
     }
   ],
   cartoons: [
     {
-      id: 'tt2861424',
-      imdb_id: 'tt2861424',
-      type: 'series',
-      name: 'Рик и Морти',
-      releaseInfo: '2013–...',
-      imdbRating: '9.1',
+      id: 'tt2861424', imdb_id: 'tt2861424', tmdbId: '60625', type: 'series',
+      name: 'Рик и Морти', releaseInfo: '2013', imdbRating: '9.1',
       genres: ['Мультфильм', 'Фантастика', 'Комедия'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/685246.jpg',
-      description: 'В центре сюжета — школьник по имени Морти и его дедушка Рик, гениальный, но эксцентричный учёный, путешествующие по мультивселенной.'
+      description: 'Приключения школьника Морти и его дедушки Рика, гениального, но эксцентричного учёного, путешествующих по мультивселенной.'
     },
     {
-      id: 'tt11126994',
-      imdb_id: 'tt11126994',
-      type: 'series',
-      name: 'Аркейн',
-      releaseInfo: '2021–2024',
-      imdbRating: '9.0',
+      id: 'tt11126994', imdb_id: 'tt11126994', tmdbId: '94605', type: 'series',
+      name: 'Аркейн', releaseInfo: '2021', imdbRating: '9.0',
       genres: ['Мультфильм', 'Фантастика', 'Боевик'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/4445150.jpg',
-      description: 'История двух сестёр, Вай и Паудер, оказавшихся по разные стороны баррикад в противостоянии утопического города Пилтовер и подземного Зауна.'
+      description: 'История двух сестёр, Вай и Паудер, оказавшихся по разные стороны баррикад в противостоянии Пилтовера и Зауна.'
     },
     {
-      id: 'tt9362722',
-      imdb_id: 'tt9362722',
-      type: 'movie',
-      name: 'Человек-паук: Паутина вселенных',
-      releaseInfo: '2023',
-      imdbRating: '8.6',
+      id: 'tt9362722', imdb_id: 'tt9362722', tmdbId: '569094', type: 'movie',
+      name: 'Человек-паук: Паутина вселенных', releaseInfo: '2023', imdbRating: '8.6',
       genres: ['Мультфильм', 'Фантастика', 'Боевик'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/1227967.jpg',
       description: 'Майлз Моралес отправляется в приключение по мультивселенной вместе с Гвен Стейси и новой командой Людей-пауков.'
-    },
-    {
-      id: 'tt0245429',
-      imdb_id: 'tt0245429',
-      type: 'movie',
-      name: 'Унесённые призраками',
-      releaseInfo: '2001',
-      imdbRating: '8.6',
-      genres: ['Мультфильм', 'Фэнтези', 'Приключения'],
-      poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/370.jpg',
-      description: 'Тихиро с мамой и папой переезжает в новый дом. Заблудившись по дороге, они оказываются в странном пустынном городе, населённом духами.'
     }
   ],
   anime: [
     {
-      id: 'tt2560140',
-      imdb_id: 'tt2560140',
-      type: 'series',
-      name: 'Атака титанов',
-      releaseInfo: '2013–2023',
-      imdbRating: '9.1',
+      id: 'tt2560140', imdb_id: 'tt2560140', tmdbId: '1429', type: 'series',
+      name: 'Атака титанов', releaseInfo: '2013', imdbRating: '9.1',
       genres: ['Экшен', 'Драма', 'Фэнтези'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/749374.jpg',
-      description: 'Человечество живёт внутри городов, окружённых тремя огромными стенами, защищающими людей от гигантских людоедов — титанов.'
+      description: 'Человечество живёт внутри городов, окружённых тремя огромными стенами, защищающими людей от гигантских титанов.'
     },
     {
-      id: 'tt29315004',
-      imdb_id: 'tt29315004',
-      type: 'series',
-      name: 'Провожающая в последний путь Фрирен',
-      releaseInfo: '2023–...',
-      imdbRating: '8.9',
+      id: 'tt29315004', imdb_id: 'tt29315004', tmdbId: '209867', type: 'series',
+      name: 'Провожающая в последний путь Фрирен', releaseInfo: '2023', imdbRating: '8.9',
       genres: ['Фэнтези', 'Приключения', 'Драма'],
       poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/5120018.jpg',
-      description: 'Одержав победу над Королём демонов, отряд героя Химмеля вернулся домой. Спустя десятилетия бессмертная эльфийка-маг Фрирен отправляется в новое путешествие.'
-    },
-    {
-      id: 'tt12343534',
-      imdb_id: 'tt12343534',
-      type: 'series',
-      name: 'Магическая битва',
-      releaseInfo: '2020–...',
-      imdbRating: '8.5',
-      genres: ['Экшен', 'Фэнтези', 'Сверхъестественное'],
-      poster: 'https://kinopoiskapiunofficial.tech/images/posters/kp/1322324.jpg',
-      description: 'Старшеклассник Юдзи Итадори проглатывает проклятый палец Двуликого Сукуны и вступает в Токийский столичный магический колледж.'
+      description: 'Одержав победу над Королём демонов, бессмертная эльфийка-маг Фрирен отправляется в новое путешествие, чтобы понять людей.'
     }
   ]
 };
 
-// Простой in-memory кэш для ускорения ответов и экономии лимитов API
 const CACHE = new Map();
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 минут
+const CACHE_TTL_MS = 30 * 60 * 1000;
 
 function getCached(key) {
   const entry = CACHE.get(key);
@@ -289,19 +202,19 @@ function getCached(key) {
 }
 
 function setCached(key, data) {
-  if (CACHE.size > 1500) {
+  if (CACHE.size > 2000) {
     const oldestKey = CACHE.keys().next().value;
     CACHE.delete(oldestKey);
   }
   CACHE.set(key, { ts: Date.now(), data });
 }
 
-// Кодирование и декодирование пользовательской конфигурации в URL
 function parseConfig(configSegment) {
   const defaults = {
-    kpKey: DEFAULT_KP_KEY,
     tmdbKey: DEFAULT_TMDB_KEY,
-    proxyPosters: true,
+    tmdbBase: DEFAULT_TMDB_BASE,
+    kpKey: DEFAULT_KP_KEY,
+    proxyMode: 'stream', // 'stream' (встроенный серверный прокси) | 'wsrv' (CDN wsrv.nl)
     enableMovies: true,
     enableSeries: true,
     enableCartoons: true,
@@ -321,43 +234,135 @@ function parseConfig(configSegment) {
   }
 }
 
-function wrapPosterUrl(url, baseUrl, proxyEnabled = true) {
-  if (!url) return undefined;
-  if (!proxyEnabled) return url;
-  // Если постер с заблокированного в РФ image.tmdb.org — проксируем через встроенный эндпоинт или wsrv.nl
-  if (url.includes('image.tmdb.org')) {
-    return `${baseUrl}/proxy/image?url=${encodeURIComponent(url)}`;
+// Формирование ссылки на постер TMDB с обходом блокировки image.tmdb.org в РФ
+function buildTmdbImageUrl(pathStr, size, baseUrl, proxyMode = 'stream') {
+  if (!pathStr) return undefined;
+  const rawTmdbImg = `https://image.tmdb.org/t/p/${size}${pathStr}`;
+  if (proxyMode === 'wsrv') {
+    return `https://wsrv.nl/?url=${encodeURIComponent(rawTmdbImg)}`;
   }
-  return url;
+  return `${baseUrl}/proxy/image?url=${encodeURIComponent(rawTmdbImg)}`;
+}
+
+// Запрос к TMDB API с автоматическим переключением между зеркалами для обхода блока в РФ
+async function fetchTmdb(pathAndQuery, config) {
+  const tmdbKey = (config && config.tmdbKey) || DEFAULT_TMDB_KEY;
+  if (!tmdbKey) return null;
+
+  const sep = pathAndQuery.includes('?') ? '&' : '?';
+  const isBearer = tmdbKey.length > 60 && tmdbKey.includes('.');
+  const fullPath = isBearer
+    ? `${pathAndQuery}${sep}language=ru-RU`
+    : `${pathAndQuery}${sep}api_key=${encodeURIComponent(tmdbKey)}&language=ru-RU`;
+
+  const cacheKey = `tmdb:${fullPath}:${tmdbKey.slice(0, 6)}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  // Список хостов TMDB: сначала пользовательский прокси (если задан), затем api.tmdb.org (реже блокируется в РФ), затем стандартный api.themoviedb.org
+  const bases = [];
+  if (config && config.tmdbBase) {
+    bases.push(config.tmdbBase.replace(/\/+$/, ''));
+  }
+  bases.push('https://api.tmdb.org/3', 'https://api.themoviedb.org/3');
+
+  let lastErr = null;
+  for (const base of bases) {
+    const url = `${base}${fullPath}`;
+    try {
+      const headers = {
+        'Accept': 'application/json',
+        'User-Agent': 'NuvioRuTmdbAddon/2.0'
+      };
+      if (isBearer) {
+        headers['Authorization'] = `Bearer ${tmdbKey}`;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 7000);
+      const res = await fetch(url, { headers, signal: controller.signal });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        setCached(cacheKey, data);
+        return data;
+      }
+      lastErr = new Error(`TMDB HTTP ${res.status} from ${base}`);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('Не удалось подключиться к TMDB API');
+}
+
+// Получение IMDb ID для элемента TMDB (кэшируется, нужно для максимальной совместимости со всеми скраперами)
+async function resolveTmdbExternalIds(mediaType, tmdbId, config) {
+  const cacheKey = `tmdb_ext:${mediaType}:${tmdbId}`;
+  const cached = getCached(cacheKey);
+  if (cached !== null) return cached;
+
+  try {
+    const data = await fetchTmdb(`/${mediaType}/${tmdbId}/external_ids`, config);
+    if (data) {
+      setCached(cacheKey, data);
+      return data;
+    }
+  } catch (_) {}
+  setCached(cacheKey, {});
+  return {};
+}
+
+// Преобразование элемента TMDB в формат карточки Nuvio/Stremio
+async function tmdbItemToMeta(item, stremioType, baseUrl, config) {
+  const mediaType = stremioType === 'series' ? 'tv' : 'movie';
+  const tmdbId = item.id;
+  const ext = await resolveTmdbExternalIds(mediaType, tmdbId, config);
+  const imdbId = (ext && ext.imdb_id) || item.imdb_id || undefined;
+
+  // Если есть IMDb ID (tt...), используем его как основной id + сохраняем tmdbId (чтобы работали и скраперы Nuvio, и торрент-аддоны)
+  const id = imdbId && imdbId.startsWith('tt') ? imdbId : `tmdb:${tmdbId}`;
+  const name = item.title || item.name || item.original_title || item.original_name || `TMDB #${tmdbId}`;
+  const dateStr = item.release_date || item.first_air_date || '';
+  const year = dateStr ? dateStr.slice(0, 4) : '';
+  const rating = item.vote_average ? Number(item.vote_average).toFixed(1) : undefined;
+
+  return {
+    id,
+    imdb_id: imdbId,
+    tmdbId: String(tmdbId),
+    type: stremioType,
+    name,
+    poster: buildTmdbImageUrl(item.poster_path, 'w500', baseUrl, config.proxyMode),
+    background: buildTmdbImageUrl(item.backdrop_path, 'original', baseUrl, config.proxyMode),
+    releaseInfo: year,
+    imdbRating: rating && rating !== '0.0' ? rating : undefined,
+    description: item.overview || 'Описание на русском языке отсутствует.'
+  };
 }
 
 // Формирование manifest.json на русском языке
-function buildManifest(config, baseUrl) {
+function buildManifest(config) {
   const catalogs = [];
 
   if (config.enableMovies !== false) {
     catalogs.push(
       {
         type: 'movie',
-        id: 'ru_movies_popular',
-        name: 'Популярные фильмы (РФ)',
+        id: 'tmdb_movies_trending',
+        name: '🔥 Фильмы: В тренде (TMDB RU)',
         extra: [
-          { name: 'genre', isRequired: false, options: MOVIE_GENRES },
           { name: 'skip', isRequired: false },
           { name: 'search', isRequired: false }
         ]
       },
       {
         type: 'movie',
-        id: 'ru_movies_top250',
-        name: 'Топ-250 лучших фильмов',
-        extra: [{ name: 'skip', isRequired: false }]
-      },
-      {
-        type: 'movie',
-        id: 'ru_movies_digital',
-        name: 'Новинки и цифровые релизы',
-        extra: [{ name: 'skip', isRequired: false }]
+        id: 'tmdb_movies_popular',
+        name: '🎬 Фильмы: Популярное и Жанры (TMDB RU)',
+        extra: [
+          { name: 'genre', isRequired: false, options: MOVIE_GENRE_LIST },
+          { name: 'skip', isRequired: false },
+          { name: 'search', isRequired: false }
+        ]
       }
     );
   }
@@ -366,19 +371,22 @@ function buildManifest(config, baseUrl) {
     catalogs.push(
       {
         type: 'series',
-        id: 'ru_series_popular',
-        name: 'Популярные сериалы (РФ)',
+        id: 'tmdb_series_trending',
+        name: '🔥 Сериалы: В тренде (TMDB RU)',
         extra: [
-          { name: 'genre', isRequired: false, options: MOVIE_GENRES },
+          { name: 'genre', isRequired: false, options: TV_GENRE_LIST },
           { name: 'skip', isRequired: false },
           { name: 'search', isRequired: false }
         ]
       },
       {
         type: 'series',
-        id: 'ru_series_top250',
-        name: 'Топ-250 сериалов',
-        extra: [{ name: 'skip', isRequired: false }]
+        id: 'tmdb_series_streaming',
+        name: '📺 Сериалы: Стриминги (Netflix, HBO, Apple TV+)',
+        extra: [
+          { name: 'genre', isRequired: false, options: NETWORK_LIST },
+          { name: 'skip', isRequired: false }
+        ]
       }
     );
   }
@@ -387,8 +395,8 @@ function buildManifest(config, baseUrl) {
     catalogs.push(
       {
         type: 'movie',
-        id: 'ru_cartoons_movies',
-        name: 'Мультфильмы (Полнометражные)',
+        id: 'tmdb_cartoons_movies',
+        name: '🧸 Мультфильмы: Полнометражные (TMDB RU)',
         extra: [
           { name: 'skip', isRequired: false },
           { name: 'search', isRequired: false }
@@ -396,8 +404,8 @@ function buildManifest(config, baseUrl) {
       },
       {
         type: 'series',
-        id: 'ru_cartoons_series',
-        name: 'Мультсериалы и анимация',
+        id: 'tmdb_cartoons_series',
+        name: '🧸 Мультсериалы и анимация (TMDB RU)',
         extra: [
           { name: 'skip', isRequired: false },
           { name: 'search', isRequired: false }
@@ -411,7 +419,7 @@ function buildManifest(config, baseUrl) {
       {
         type: 'series',
         id: 'ru_anime_popular',
-        name: 'Аниме: Популярное (Shikimori)',
+        name: '⛩️ Аниме: Сериалы (TMDB RU / Shikimori)',
         extra: [
           { name: 'genre', isRequired: false, options: ANIME_GENRES },
           { name: 'skip', isRequired: false },
@@ -419,18 +427,9 @@ function buildManifest(config, baseUrl) {
         ]
       },
       {
-        type: 'series',
-        id: 'ru_anime_ongoing',
-        name: 'Аниме: Онгоинги сезона',
-        extra: [
-          { name: 'genre', isRequired: false, options: ANIME_GENRES },
-          { name: 'skip', isRequired: false }
-        ]
-      },
-      {
         type: 'movie',
         id: 'ru_anime_movies',
-        name: 'Аниме: Полнометражные фильмы',
+        name: '⛩️ Аниме: Полнометражное (TMDB RU / Shikimori)',
         extra: [
           { name: 'genre', isRequired: false, options: ANIME_GENRES },
           { name: 'skip', isRequired: false },
@@ -441,19 +440,19 @@ function buildManifest(config, baseUrl) {
   }
 
   return {
-    id: 'org.nuvio.ru.catalogs',
-    version: '1.2.0',
-    name: 'Nuvio RU: Каталоги (Фильмы, Сериалы, Мультики, Аниме)',
-    description: 'Русскоязычный каталог для Nuvio и Stremio, работающий в России без VPN (Кинопоиск + Shikimori + совместимость со скраперами Nuvio через IMDb/TMDB ID).',
+    id: 'org.nuvio.ru.tmdb.catalogs',
+    version: '2.0.0',
+    name: 'Nuvio RU: TMDB + Кинопоиск + Shikimori (Без VPN в РФ)',
+    description: 'Русскоязычные каталоги TMDB (ru-RU), Кинопоиска и Shikimori с встроенным проксированием API и обложек для работы в России без VPN.',
     logo: 'https://wsrv.nl/?url=https://raw.githubusercontent.com/Stremio/stremio-art/master/logo.png',
     types: ['movie', 'series'],
-    idPrefixes: ['tt', 'kp:', 'shiki:'],
+    idPrefixes: ['tt', 'tmdb:', 'kp:', 'shiki:'],
     resources: [
       'catalog',
       {
         name: 'meta',
         types: ['movie', 'series'],
-        idPrefixes: ['tt', 'kp:', 'shiki:']
+        idPrefixes: ['tt', 'tmdb:', 'kp:', 'shiki:']
       }
     ],
     catalogs,
@@ -464,56 +463,7 @@ function buildManifest(config, baseUrl) {
   };
 }
 
-// Запрос к Kinopoisk Unofficial API
-async function fetchKinopoisk(endpoint, kpKey) {
-  if (!kpKey) return null;
-  const url = `https://kinopoiskapiunofficial.tech${endpoint}`;
-  const cacheKey = `kp:${url}:${kpKey.slice(0, 6)}`;
-  const cached = getCached(cacheKey);
-  if (cached) return cached;
-
-  const res = await fetch(url, {
-    headers: {
-      'X-API-KEY': kpKey,
-      'Content-Type': 'application/json',
-      'User-Agent': 'NuvioRuCatalogAddon/1.2'
-    }
-  });
-  if (!res.ok) {
-    throw new Error(`Kinopoisk API HTTP ${res.status}`);
-  }
-  const data = await res.json();
-  setCached(cacheKey, data);
-  return data;
-}
-
-// Преобразование элемента Кинопоиска в формат Meta Preview для Nuvio/Stremio
-function kpItemToMeta(item, defaultType = 'movie', baseUrl = '', proxyPosters = true) {
-  const kpId = item.kinopoiskId || item.filmId;
-  // Если есть imdbId (например tt1234567), используем его напрямую, чтобы скраперы Nuvio сразу находили потоки!
-  const id = item.imdbId && item.imdbId.startsWith('tt') ? item.imdbId : `kp:${kpId}`;
-  const name = item.nameRu || item.nameEn || item.nameOriginal || `Фильм #${kpId}`;
-  const isSeries = item.type === 'TV_SERIES' || item.type === 'MINI_SERIES' || item.type === 'TV_SHOW' || defaultType === 'series';
-  const type = isSeries ? 'series' : 'movie';
-  const rating = item.ratingKinopoisk || item.ratingImdb || (item.rating && item.rating !== 'null' ? item.rating : undefined);
-  const genres = Array.isArray(item.genres) ? item.genres.map(g => g.genre).filter(Boolean) : [];
-  const year = item.year && item.year !== 'null' ? String(item.year) : '';
-
-  return {
-    id,
-    imdb_id: item.imdbId || undefined,
-    type,
-    name,
-    poster: wrapPosterUrl(item.posterUrlPreview || item.posterUrl, baseUrl, proxyPosters),
-    background: wrapPosterUrl(item.coverUrl || item.posterUrl, baseUrl, proxyPosters),
-    genres,
-    releaseInfo: year,
-    imdbRating: rating ? String(rating) : undefined,
-    description: item.description || item.shortDescription || (genres.length ? `Жанры: ${genres.join(', ')} ${year ? `(${year})` : ''}` : undefined)
-  };
-}
-
-// Запрос к Shikimori API (работает в РФ без ключа и без VPN)
+// Запрос к Shikimori API (работает в РФ без ключей)
 async function fetchShikimoriCatalog({ kind, status, genreName, search, page = 1 }) {
   const params = new URLSearchParams();
   params.set('limit', '20');
@@ -522,39 +472,27 @@ async function fetchShikimoriCatalog({ kind, status, genreName, search, page = 1
   if (kind) params.set('kind', kind);
   if (status) params.set('status', status);
   if (search) params.set('search', search);
-  if (genreName) {
-    const gId = SHIKI_GENRE_IDS[genreName.toLowerCase()];
-    if (gId) params.set('genre', String(gId));
+  if (genreName && SHIKI_GENRE_IDS[genreName.toLowerCase()]) {
+    params.set('genre', String(SHIKI_GENRE_IDS[genreName.toLowerCase()]));
   }
 
   const url = `https://shikimori.one/api/animes?${params.toString()}`;
-  const cacheKey = `shiki:${url}`;
-  const cached = getCached(cacheKey);
+  const cached = getCached(`shiki:${url}`);
   if (cached) return cached;
 
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'NuvioRuCatalogAddon/1.2 (https://nuvio.tv)'
-    }
-  });
-  if (!res.ok) {
-    throw new Error(`Shikimori API HTTP ${res.status}`);
-  }
+  const res = await fetch(url, { headers: { 'User-Agent': 'NuvioRuTmdbAddon/2.0' } });
+  if (!res.ok) throw new Error(`Shikimori HTTP ${res.status}`);
   const data = await res.json();
-  setCached(cacheKey, data);
+  setCached(`shiki:${url}`, data);
   return data;
 }
 
-// Конвертация MyAnimeList / Shikimori ID в IMDb ID и TMDB ID через публичный маппер ARM API (для скраперов Nuvio)
 async function resolveMalToExternalIds(malId) {
   const cacheKey = `arm:${malId}`;
   const cached = getCached(cacheKey);
   if (cached !== null) return cached;
-
   try {
-    const res = await fetch(`https://arm.haglund.dev/api/v2/ids?source=myanimelist&id=${encodeURIComponent(malId)}`, {
-      headers: { 'User-Agent': 'NuvioRuCatalogAddon/1.2' }
-    });
+    const res = await fetch(`https://arm.haglund.dev/api/v2/ids?source=myanimelist&id=${encodeURIComponent(malId)}`);
     if (res.ok) {
       const data = await res.json();
       setCached(cacheKey, data || {});
@@ -565,231 +503,161 @@ async function resolveMalToExternalIds(malId) {
   return {};
 }
 
-function shikiItemToMeta(item, forcedType = 'series') {
-  const shikiId = item.id;
-  const name = item.russian || item.name || `Аниме #${shikiId}`;
-  const type = item.kind === 'movie' || forcedType === 'movie' ? 'movie' : 'series';
-  const poster = item.image && item.image.original
-    ? `https://shikimori.one${item.image.original}`
-    : undefined;
-  const year = item.aired_on ? item.aired_on.slice(0, 4) : '';
-
-  return {
-    id: `shiki:${shikiId}`,
-    type,
-    name,
-    poster,
-    releaseInfo: year,
-    imdbRating: item.score && item.score !== '0.0' ? String(item.score) : undefined,
-    description: `${name} (${item.name || ''}). Тип: ${item.kind === 'movie' ? 'Полнометражное аниме' : 'Аниме-сериал'}${year ? `, ${year} г.` : ''}. Рейтинг Shikimori: ${item.score || '—'}.`
-  };
-}
-
-// Обработка запросов /catalog/{type}/{id}/{extra}.json
+// Обработка каталогов (/catalog/{type}/{id}/{extra}.json)
 async function handleCatalog(type, catalogId, extraArgs, config, baseUrl) {
   const skip = Number(extraArgs.skip || 0);
   const page = Math.floor(skip / 20) + 1;
   const search = extraArgs.search ? String(extraArgs.search).trim() : '';
   const genre = extraArgs.genre ? String(extraArgs.genre).trim() : '';
 
-  // 1. Аниме каталоги через Shikimori (работают в РФ всегда, даже без API-ключей)
+  // 1. Если указан ключ TMDB — загружаем каталоги напрямую из TMDB (ru-RU) с проксированием обложек!
+  if (config.tmdbKey) {
+    try {
+      const mediaType = type === 'series' ? 'tv' : 'movie';
+      let endpoint = '';
+
+      if (search) {
+        endpoint = `/search/${mediaType}?query=${encodeURIComponent(search)}&page=${page}&include_adult=false`;
+      } else if (catalogId === 'tmdb_movies_trending') {
+        endpoint = `/trending/movie/week?page=${page}`;
+      } else if (catalogId === 'tmdb_series_trending') {
+        if (genre && TMDB_TV_GENRES[genre]) {
+          endpoint = `/discover/tv?sort_by=popularity.desc&with_genres=${TMDB_TV_GENRES[genre]}&page=${page}`;
+        } else {
+          endpoint = `/trending/tv/week?page=${page}`;
+        }
+      } else if (catalogId === 'tmdb_movies_popular') {
+        const gId = genre && TMDB_MOVIE_GENRES[genre] ? `&with_genres=${TMDB_MOVIE_GENRES[genre]}` : '';
+        endpoint = `/discover/movie?sort_by=popularity.desc${gId}&page=${page}`;
+      } else if (catalogId === 'tmdb_series_streaming') {
+        const netId = (genre && STREAMING_NETWORKS[genre]) || 213; // По умолчанию Netflix
+        endpoint = `/discover/tv?sort_by=popularity.desc&with_networks=${netId}&page=${page}`;
+      } else if (catalogId === 'tmdb_cartoons_movies') {
+        // Жанр 16 (Мультфильм), исключая японское аниме (with_original_language=!ja)
+        endpoint = `/discover/movie?sort_by=popularity.desc&with_genres=16&without_original_language=ja&page=${page}`;
+      } else if (catalogId === 'tmdb_cartoons_series') {
+        endpoint = `/discover/tv?sort_by=popularity.desc&with_genres=16&without_original_language=ja&page=${page}`;
+      } else if (catalogId === 'ru_anime_popular') {
+        // Аниме-сериалы в TMDB: жанр 16 (Animation) + оригинальный язык японский (ja)
+        endpoint = `/discover/tv?sort_by=popularity.desc&with_genres=16&with_original_language=ja&page=${page}`;
+      } else if (catalogId === 'ru_anime_movies') {
+        endpoint = `/discover/movie?sort_by=popularity.desc&with_genres=16&with_original_language=ja&page=${page}`;
+      } else {
+        endpoint = `/discover/${mediaType}?sort_by=popularity.desc&page=${page}`;
+      }
+
+      const data = await fetchTmdb(endpoint, config);
+      if (data && Array.isArray(data.results) && data.results.length > 0) {
+        const metas = await Promise.all(
+          data.results.slice(0, 20).map(item => tmdbItemToMeta(item, type, baseUrl, config))
+        );
+        return { metas };
+      }
+    } catch (_) {
+      // Если TMDB недоступен — плавно переходим к Shikimori / Кинопоиску / резервному каталогу
+    }
+  }
+
+  // 2. Аниме через Shikimori (работает в РФ вообще без ключей!)
   if (catalogId.startsWith('ru_anime_')) {
     try {
       const kind = catalogId === 'ru_anime_movies' ? 'movie' : 'tv,ona';
-      const status = catalogId === 'ru_anime_ongoing' ? 'ongoing' : undefined;
-      const items = await fetchShikimoriCatalog({
-        kind,
-        status,
-        genreName: genre,
-        search,
-        page
-      });
+      const items = await fetchShikimoriCatalog({ kind, genreName: genre, search, page });
       if (Array.isArray(items) && items.length > 0) {
-        // Для первых элементов параллельно пробуем подтянуть IMDb ID, чтобы скраперы Nuvio срабатывали мгновенно
         const metas = await Promise.all(items.map(async (it) => {
-          const baseMeta = shikiItemToMeta(it, type);
           const ext = await resolveMalToExternalIds(it.id);
-          if (ext && ext.imdb) {
-            baseMeta.id = ext.imdb;
-            baseMeta.imdb_id = ext.imdb;
-          }
-          return baseMeta;
+          const imdbId = ext.imdb || undefined;
+          return {
+            id: imdbId || `shiki:${it.id}`,
+            imdb_id: imdbId,
+            tmdbId: ext.themoviedb ? String(ext.themoviedb) : undefined,
+            type,
+            name: it.russian || it.name,
+            poster: it.image && it.image.original ? `https://shikimori.one${it.image.original}` : undefined,
+            releaseInfo: it.aired_on ? it.aired_on.slice(0, 4) : '',
+            imdbRating: it.score && it.score !== '0.0' ? String(it.score) : undefined,
+            description: `${it.russian || it.name} (${it.name || ''}) — Рейтинг Shikimori: ${it.score || '—'}`
+          };
         }));
         return { metas };
       }
-    } catch (err) {
-      // Если нет сети или ошибка — вернем встроенный резервный список аниме
-    }
+    } catch (_) {}
     return { metas: FALLBACK_CATALOG.anime };
   }
 
-  // 2. Фильмы, Сериалы и Мультфильмы через Kinopoisk Unofficial API (если указан ключ)
-  if (config.kpKey) {
-    try {
-      // Поиск по ключевому слову
-      if (search) {
-        const data = await fetchKinopoisk(
-          `/api/v2.1/films/search-by-keyword?keyword=${encodeURIComponent(search)}&page=${page}`,
-          config.kpKey
-        );
-        const films = (data && data.films) || [];
-        return {
-          metas: films.map(f => kpItemToMeta(f, type, baseUrl, config.proxyPosters))
-        };
-      }
-
-      // Коллекции Топ-250 и Популярное
-      if (catalogId === 'ru_movies_top250') {
-        const data = await fetchKinopoisk(`/api/v2.2/films/collections?type=TOP_250_MOVIES&page=${page}`, config.kpKey);
-        return { metas: ((data && data.items) || []).map(f => kpItemToMeta(f, 'movie', baseUrl, config.proxyPosters)) };
-      }
-      if (catalogId === 'ru_series_top250') {
-        const data = await fetchKinopoisk(`/api/v2.2/films/collections?type=TOP_250_TV_SHOWS&page=${page}`, config.kpKey);
-        return { metas: ((data && data.items) || []).map(f => kpItemToMeta(f, 'series', baseUrl, config.proxyPosters)) };
-      }
-      if (catalogId === 'ru_movies_digital') {
-        const data = await fetchKinopoisk(`/api/v2.2/films/collections?type=TOP_POPULAR_MOVIES&page=${page}`, config.kpKey);
-        return { metas: ((data && data.items) || []).map(f => kpItemToMeta(f, 'movie', baseUrl, config.proxyPosters)) };
-      }
-
-      // Фильтрация по типу и жанрам (Фильмы / Сериалы / Мультфильмы)
-      const params = new URLSearchParams();
-      params.set('order', 'NUM_VOTE');
-      params.set('page', String(page));
-
-      if (catalogId === 'ru_cartoons_movies') {
-        params.set('type', 'FILM');
-        params.set('genres', String(KP_GENRE_IDS['мультфильм']));
-      } else if (catalogId === 'ru_cartoons_series') {
-        params.set('type', 'TV_SERIES');
-        params.set('genres', String(KP_GENRE_IDS['мультфильм']));
-      } else if (type === 'series') {
-        params.set('type', 'TV_SERIES');
-      } else {
-        params.set('type', 'FILM');
-      }
-
-      if (genre && KP_GENRE_IDS[genre.toLowerCase()]) {
-        params.set('genres', String(KP_GENRE_IDS[genre.toLowerCase()]));
-      }
-
-      const data = await fetchKinopoisk(`/api/v2.2/films?${params.toString()}`, config.kpKey);
-      return {
-        metas: ((data && data.items) || []).map(f => kpItemToMeta(f, type, baseUrl, config.proxyPosters))
-      };
-    } catch (err) {
-      // Переход к резервному списку при ошибке API
-    }
-  }
-
-  // 3. Встроенный резервный каталог (чтобы аддон работал сразу после установки в Nuvio даже без ключа)
-  let list = FALLBACK_CATALOG.movies;
-  if (catalogId.includes('cartoons')) {
-    list = FALLBACK_CATALOG.cartoons.filter(i => i.type === type || catalogId === 'ru_cartoons_movies');
-  } else if (type === 'series') {
-    list = FALLBACK_CATALOG.series;
-  }
-
-  if (genre) {
-    const gLower = genre.toLowerCase();
-    const filtered = list.filter(i => (i.genres || []).some(g => g.toLowerCase() === gLower));
-    if (filtered.length > 0) list = filtered;
-  }
-
-  if (search) {
-    const sLower = search.toLowerCase();
-    const all = [
-      ...FALLBACK_CATALOG.movies,
-      ...FALLBACK_CATALOG.series,
-      ...FALLBACK_CATALOG.cartoons,
-      ...FALLBACK_CATALOG.anime
-    ];
-    list = all.filter(i => i.name.toLowerCase().includes(sLower));
-  }
-
-  return { metas: list };
+  // 3. Резервный стартовый список (если пользователь еще не ввел ключ TMDB)
+  if (catalogId.includes('cartoons')) return { metas: FALLBACK_CATALOG.cartoons };
+  if (type === 'series') return { metas: FALLBACK_CATALOG.series };
+  return { metas: FALLBACK_CATALOG.movies };
 }
 
-// Обработка запросов /meta/{type}/{id}.json (карточка фильма/сериала на русском + привязка к IMDb/TMDB ID для скраперов)
+// Обработка детальной карточки (/meta/{type}/{id}.json) на русском языке со списком серий из TMDB
 async function handleMeta(type, rawId, config, baseUrl) {
   const id = decodeURIComponent(rawId);
 
-  // 1. Карточка из Shikimori (shiki:12345)
-  if (id.startsWith('shiki:')) {
-    const shikiId = id.replace('shiki:', '');
+  if (config.tmdbKey) {
     try {
-      const res = await fetch(`https://shikimori.one/api/animes/${encodeURIComponent(shikiId)}`, {
-        headers: { 'User-Agent': 'NuvioRuCatalogAddon/1.2' }
-      });
-      if (res.ok) {
-        const item = await res.json();
-        const ext = await resolveMalToExternalIds(shikiId);
-        const imdbId = ext.imdb || undefined;
-        const tmdbId = ext.themoviedb || undefined;
-        const cleanDesc = (item.description || 'Описание на русском языке временно отсутствует.')
-          .replace(/\[.*?\]/g, '');
-        const genres = Array.isArray(item.genres) ? item.genres.map(g => g.russian || g.name).filter(Boolean) : [];
-        return {
-          meta: {
-            id: imdbId || id,
-            imdb_id: imdbId,
-            tmdbId: tmdbId ? String(tmdbId) : undefined,
-            type,
-            name: item.russian || item.name,
-            originalName: item.name,
-            releaseInfo: item.aired_on ? item.aired_on.slice(0, 4) : '',
-            imdbRating: item.score ? String(item.score) : undefined,
-            genres,
-            poster: item.image && item.image.original ? `https://shikimori.one${item.image.original}` : undefined,
-            description: cleanDesc
-          }
-        };
-      }
-    } catch (_) {}
-  }
+      const mediaType = type === 'series' ? 'tv' : 'movie';
+      let tmdbId = id.startsWith('tmdb:') ? id.replace('tmdb:', '') : null;
 
-  // 2. Карточка из Кинопоиска (kp:12345 или поиск по IMDb tt...)
-  if (config.kpKey) {
-    try {
-      let kpId = id.startsWith('kp:') ? id.replace('kp:', '') : null;
-      if (!kpId && id.startsWith('tt')) {
-        const searchData = await fetchKinopoisk(`/api/v2.2/films?imdbId=${encodeURIComponent(id)}`, config.kpKey);
-        if (searchData && Array.isArray(searchData.items) && searchData.items[0]) {
-          kpId = String(searchData.items[0].kinopoiskId);
+      // Если передан IMDb ID (tt...), находим его TMDB ID через /find/{id}
+      if (!tmdbId && id.startsWith('tt')) {
+        const findData = await fetchTmdb(`/find/${encodeURIComponent(id)}?external_source=imdb_id`, config);
+        if (findData) {
+          const results = type === 'series'
+            ? (findData.tv_results && findData.tv_results.length ? findData.tv_results : findData.movie_results)
+            : (findData.movie_results && findData.movie_results.length ? findData.movie_results : findData.tv_results);
+          if (results && results[0]) {
+            tmdbId = String(results[0].id);
+          }
         }
       }
-      if (kpId) {
-        const film = await fetchKinopoisk(`/api/v2.2/films/${encodeURIComponent(kpId)}`, config.kpKey);
-        if (film) {
-          const metaObj = kpItemToMeta(film, type, baseUrl, config.proxyPosters);
-          metaObj.id = film.imdbId || id;
-          metaObj.imdb_id = film.imdbId || undefined;
-          metaObj.runtime = film.filmLength ? `${film.filmLength} мин.` : undefined;
-          metaObj.country = Array.isArray(film.countries) ? film.countries.map(c => c.country).join(', ') : undefined;
 
-          // Если это сериал — подгружаем сезоны и серии для скраперов Nuvio
-          if (type === 'series' && metaObj.imdb_id) {
-            try {
-              const seasonsData = await fetchKinopoisk(`/api/v2.2/films/${encodeURIComponent(kpId)}/seasons`, config.kpKey);
-              if (seasonsData && Array.isArray(seasonsData.items)) {
-                const videos = [];
-                for (const season of seasonsData.items) {
-                  for (const ep of (season.episodes || [])) {
-                    videos.push({
-                      id: `${metaObj.imdb_id}:${season.number}:${ep.episodeNumber}`,
-                      title: ep.nameRu || ep.nameEn || `Серия ${ep.episodeNumber}`,
-                      season: season.number,
-                      episode: ep.episodeNumber,
-                      released: ep.releaseDate ? new Date(ep.releaseDate).toISOString() : undefined,
-                      overview: ep.synopsis || undefined
-                    });
-                  }
-                }
-                if (videos.length > 0) {
-                  metaObj.videos = videos;
-                }
+      if (tmdbId) {
+        const details = await fetchTmdb(`/${mediaType}/${encodeURIComponent(tmdbId)}?append_to_response=external_ids,credits`, config);
+        if (details) {
+          const imdbId = (details.external_ids && details.external_ids.imdb_id) || details.imdb_id || (id.startsWith('tt') ? id : undefined);
+          const metaObj = {
+            id: imdbId || `tmdb:${tmdbId}`,
+            imdb_id: imdbId,
+            tmdbId: String(tmdbId),
+            type,
+            name: details.title || details.name || details.original_title || details.original_name,
+            releaseInfo: (details.release_date || details.first_air_date || '').slice(0, 4),
+            imdbRating: details.vote_average ? Number(details.vote_average).toFixed(1) : undefined,
+            genres: Array.isArray(details.genres) ? details.genres.map(g => g.name) : [],
+            poster: buildTmdbImageUrl(details.poster_path, 'w500', baseUrl, config.proxyMode),
+            background: buildTmdbImageUrl(details.backdrop_path, 'original', baseUrl, config.proxyMode),
+            description: details.overview || 'Описание на русском языке отсутствует.',
+            runtime: details.runtime ? `${details.runtime} мин.` : undefined
+          };
+
+          // Если это сериал — загружаем список сезонов и серий на русском языке
+          if (mediaType === 'tv' && Array.isArray(details.seasons)) {
+            const videos = [];
+            const validSeasons = details.seasons.filter(s => s.season_number > 0).slice(0, 15);
+            const seasonResponses = await Promise.all(
+              validSeasons.map(s =>
+                fetchTmdb(`/tv/${encodeURIComponent(tmdbId)}/season/${s.season_number}`, config).catch(() => null)
+              )
+            );
+            for (const sData of seasonResponses) {
+              if (!sData || !Array.isArray(sData.episodes)) continue;
+              for (const ep of sData.episodes) {
+                videos.push({
+                  id: `${imdbId || `tmdb:${tmdbId}`}:${sData.season_number}:${ep.episode_number}`,
+                  title: ep.name || `Серия ${ep.episode_number}`,
+                  season: sData.season_number,
+                  episode: ep.episode_number,
+                  released: ep.air_date ? new Date(ep.air_date).toISOString() : undefined,
+                  overview: ep.overview || undefined,
+                  thumbnail: buildTmdbImageUrl(ep.still_path, 'w300', baseUrl, config.proxyMode)
+                });
               }
-            } catch (_) {}
+            }
+            if (videos.length > 0) {
+              metaObj.videos = videos;
+            }
           }
           return { meta: metaObj };
         }
@@ -797,207 +665,122 @@ async function handleMeta(type, rawId, config, baseUrl) {
     } catch (_) {}
   }
 
-  // 3. Проверка во встроенном резервном списке
   const allFallback = [
     ...FALLBACK_CATALOG.movies,
     ...FALLBACK_CATALOG.series,
     ...FALLBACK_CATALOG.cartoons,
     ...FALLBACK_CATALOG.anime
   ];
-  const found = allFallback.find(i => i.id === id || i.imdb_id === id);
-  if (found) {
-    return { meta: found };
-  }
-
-  return { meta: null };
+  const found = allFallback.find(i => i.id === id || i.imdb_id === id || `tmdb:${i.tmdbId}` === id);
+  return { meta: found || null };
 }
 
-// Русскоязычная страница настройки (/configure)
+// Страница настройки (/configure) на русском языке
 function renderConfigureHtml(baseUrl) {
   return `<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Nuvio RU — Конфигуратор русских каталогов</title>
+  <title>Nuvio RU — Русский TMDB + Shikimori без VPN</title>
   <style>
     :root {
-      --bg: #0f172a;
-      --card: #1e293b;
-      --border: #334155;
-      --accent: #38bdf8;
-      --accent-hover: #0284c7;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --success: #22c55e;
+      --bg: #0f172a; --card: #1e293b; --border: #334155;
+      --accent: #38bdf8; --accent-hover: #0284c7; --text: #f8fafc;
+      --muted: #94a3b8; --success: #22c55e;
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0;
-      padding: 32px 16px;
+      margin: 0; padding: 24px 14px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.5;
+      background: var(--bg); color: var(--text); line-height: 1.5;
     }
     .container {
-      max-width: 680px;
-      margin: 0 auto;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 28px;
+      max-width: 680px; margin: 0 auto; background: var(--card);
+      border: 1px solid var(--border); border-radius: 16px; padding: 24px;
       box-shadow: 0 20px 40px rgba(0,0,0,0.4);
     }
-    h1 {
-      margin: 0 0 8px 0;
-      font-size: 24px;
-      color: var(--accent);
+    h1 { margin: 0 0 8px 0; font-size: 22px; color: var(--accent); }
+    p.sub { margin: 0 0 20px 0; color: var(--muted); font-size: 14px; }
+    .section { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    label.field-label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 14px; }
+    input[type="text"], select {
+      width: 100%; padding: 11px 14px; border-radius: 8px;
+      border: 1px solid var(--border); background: #0b1120; color: var(--text); font-size: 14px;
     }
-    p.sub {
-      margin: 0 0 24px 0;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .section {
-      margin-bottom: 22px;
-      padding-bottom: 18px;
-      border-bottom: 1px solid var(--border);
-    }
-    label.field-label {
-      display: block;
-      font-weight: 600;
-      margin-bottom: 6px;
-      font-size: 14px;
-    }
-    input[type="text"] {
-      width: 100%;
-      padding: 11px 14px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: #0b1120;
-      color: var(--text);
-      font-size: 14px;
-    }
-    .hint {
-      font-size: 12px;
-      color: var(--muted);
-      margin-top: 6px;
-    }
-    .hint a {
-      color: var(--accent);
-      text-decoration: none;
-    }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .hint a { color: var(--accent); text-decoration: none; }
     .checkbox-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 10px;
-      margin-top: 10px;
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px; margin-top: 10px;
     }
     .check-item {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      background: #0b1120;
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      font-size: 14px;
-      cursor: pointer;
+      display: flex; align-items: center; gap: 10px; background: #0b1120;
+      padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); font-size: 14px;
     }
     .url-box {
-      background: #0b1120;
-      border: 1px solid var(--accent);
-      border-radius: 10px;
-      padding: 12px 14px;
-      font-family: monospace;
-      font-size: 13px;
-      word-break: break-all;
-      margin-bottom: 14px;
-      color: #e2e8f0;
+      background: #0b1120; border: 1px solid var(--accent); border-radius: 10px;
+      padding: 12px 14px; font-family: monospace; font-size: 13px;
+      word-break: break-all; margin-bottom: 14px; color: #e2e8f0;
     }
-    .btn-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-    }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 10px; }
     button, a.btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 11px 18px;
-      border-radius: 8px;
-      font-weight: 600;
-      font-size: 14px;
-      border: none;
-      cursor: pointer;
-      text-decoration: none;
-      transition: background 0.15s;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 11px 18px; border-radius: 8px; font-weight: 600; font-size: 14px;
+      border: none; cursor: pointer; text-decoration: none;
     }
-    .btn-primary {
-      background: var(--accent);
-      color: #0f172a;
-    }
-    .btn-primary:hover {
-      background: var(--accent-hover);
-      color: #fff;
-    }
-    .btn-secondary {
-      background: #334155;
-      color: var(--text);
-    }
+    .btn-primary { background: var(--accent); color: #0f172a; }
+    .btn-secondary { background: #334155; color: var(--text); }
     .badge {
-      display: inline-block;
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 600;
-      background: rgba(34, 197, 94, 0.15);
-      color: var(--success);
-      margin-left: 8px;
+      display: inline-block; padding: 3px 8px; border-radius: 999px;
+      font-size: 11px; font-weight: 600; background: rgba(34, 197, 94, 0.15); color: var(--success);
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>Nuvio RU: Русские каталоги <span class="badge">Работает в РФ без VPN</span></h1>
-    <p class="sub">Фильмы, сериалы, мультфильмы и аниме на русском языке с передачей IMDb/TMDB ID для скраперов Nuvio.</p>
+    <h1>Nuvio RU: TMDB на русском языке <span class="badge">Обход блока РФ</span></h1>
+    <p class="sub">Фильмы, сериалы, хиты стримингов, мультфильмы и аниме из базы TMDB (ru-RU) и Shikimori с проксированием обложек для работы в России без VPN.</p>
 
     <div class="section">
-      <label class="field-label" for="kpKey">API-ключ Kinopoisk Unofficial (для полного каталога фильмов, сериалов и мультфильмов)</label>
-      <input type="text" id="kpKey" placeholder="Например: a1b2c3d4-e5f6-7890-abcd-ef1234567890 (необязательно для теста)" />
+      <label class="field-label" for="tmdbKey">Ваш ключ TMDB API (v3 API Key или Read Access Token)</label>
+      <input type="text" id="tmdbKey" placeholder="Вставьте ваш бесплатный ключ TMDB (например: 3e4a5b6c...)" />
       <div class="hint">
-        Бесплатный ключ (до 500 запросов в сутки, работает в РФ без VPN) можно получить за 1 минуту на
-        <a href="https://kinopoiskapiunofficial.tech/" target="_blank" rel="noopener">kinopoiskapiunofficial.tech</a>.
-        Каталог аниме (Shikimori) и стартовая подборка работают сразу даже без ключа.
+        Все запросы к TMDB идут через резервный домен <code>api.tmdb.org</code> или с сервера хостинга, а обложки с <code>image.tmdb.org</code> туннелируются через прокси, поэтому всё грузится в РФ без VPN.
       </div>
     </div>
 
     <div class="section">
-      <label class="field-label">Выберите разделы для главного экрана Nuvio</label>
+      <label class="field-label" for="proxyMode">Способ проксирования постеров TMDB в РФ</label>
+      <select id="proxyMode">
+        <option value="stream">Через этот сервер (/proxy/image — скрывает image.tmdb.org от провайдера)</option>
+        <option value="wsrv">Через глобальный кеш-CDN wsrv.nl (быстрая загрузка картинок)</option>
+      </select>
+    </div>
+
+    <div class="section">
+      <label class="field-label">Полки каталогов для главного экрана Nuvio</label>
       <div class="checkbox-grid">
-        <label class="check-item"><input type="checkbox" id="enableMovies" checked /> 🎬 Фильмы (Популярное, Топ-250, Новинки)</label>
-        <label class="check-item"><input type="checkbox" id="enableSeries" checked /> 📺 Сериалы (Популярное, Топ-250)</label>
-        <label class="check-item"><input type="checkbox" id="enableCartoons" checked /> 🧸 Мультфильмы и мультсериалы</label>
-        <label class="check-item"><input type="checkbox" id="enableAnime" checked /> ⛩️ Аниме (Shikimori: Популярное и Онгоинги)</label>
-        <label class="check-item"><input type="checkbox" id="proxyPosters" checked /> 🖼️ Проксировать постеры (обход блока РФ)</label>
+        <label class="check-item"><input type="checkbox" id="enableMovies" checked /> 🎬 Фильмы (Тренды и Жанры TMDB)</label>
+        <label class="check-item"><input type="checkbox" id="enableSeries" checked /> 📺 Сериалы и Стриминги (Netflix, HBO)</label>
+        <label class="check-item"><input type="checkbox" id="enableCartoons" checked /> 🧸 Мультфильмы и Мультсериалы</label>
+        <label class="check-item"><input type="checkbox" id="enableAnime" checked /> ⛩️ Аниме (TMDB RU + Shikimori)</label>
       </div>
     </div>
 
     <div>
-      <label class="field-label">Готовая ссылка на манифест для вставки в Nuvio (Settings → Addons → Add Addon):</label>
+      <label class="field-label">Готовая ссылка на манифест для Nuvio (Settings → Addons → Add Addon):</label>
       <div class="url-box" id="manifestUrl">${baseUrl}/manifest.json</div>
       <div class="btn-row">
         <button class="btn-primary" id="copyBtn" type="button">Скопировать ссылку для Nuvio</button>
         <a class="btn btn-secondary" id="stremioBtn" href="stremio://${baseUrl.replace(/^https?:\/\//, '')}/manifest.json">Открыть через stremio://</a>
-        <a class="btn btn-secondary" id="jsonBtn" href="${baseUrl}/manifest.json" target="_blank">Проверить manifest.json</a>
       </div>
     </div>
   </div>
 
   <script>
     const baseUrl = ${JSON.stringify(baseUrl)};
-    const inputs = ['kpKey', 'enableMovies', 'enableSeries', 'enableCartoons', 'enableAnime', 'proxyPosters'];
+    const fields = ['tmdbKey', 'proxyMode', 'enableMovies', 'enableSeries', 'enableCartoons', 'enableAnime'];
 
     function toBase64Url(str) {
       return btoa(unescape(encodeURIComponent(str)))
@@ -1008,33 +791,30 @@ function renderConfigureHtml(baseUrl) {
 
     function updateUrl() {
       const cfg = {
-        kpKey: document.getElementById('kpKey').value.trim(),
+        tmdbKey: document.getElementById('tmdbKey').value.trim(),
+        proxyMode: document.getElementById('proxyMode').value,
         enableMovies: document.getElementById('enableMovies').checked,
         enableSeries: document.getElementById('enableSeries').checked,
         enableCartoons: document.getElementById('enableCartoons').checked,
-        enableAnime: document.getElementById('enableAnime').checked,
-        proxyPosters: document.getElementById('proxyPosters').checked
+        enableAnime: document.getElementById('enableAnime').checked
       };
-
-      const isDefault = !cfg.kpKey && cfg.enableMovies && cfg.enableSeries && cfg.enableCartoons && cfg.enableAnime && cfg.proxyPosters;
+      const isDefault = !cfg.tmdbKey && cfg.proxyMode === 'stream' && cfg.enableMovies && cfg.enableSeries && cfg.enableCartoons && cfg.enableAnime;
       const url = isDefault
         ? baseUrl + '/manifest.json'
         : baseUrl + '/' + toBase64Url(JSON.stringify(cfg)) + '/manifest.json';
 
       document.getElementById('manifestUrl').textContent = url;
       document.getElementById('stremioBtn').href = url.replace(/^https?:\\/\\//, 'stremio://');
-      document.getElementById('jsonBtn').href = url;
     }
 
-    inputs.forEach(id => {
+    fields.forEach(id => {
       document.getElementById(id).addEventListener('input', updateUrl);
       document.getElementById(id).addEventListener('change', updateUrl);
     });
 
     document.getElementById('copyBtn').addEventListener('click', async () => {
-      const text = document.getElementById('manifestUrl').textContent;
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(document.getElementById('manifestUrl').textContent);
         const btn = document.getElementById('copyBtn');
         btn.textContent = 'Скопировано!';
         setTimeout(() => { btn.textContent = 'Скопировать ссылку для Nuvio'; }, 2000);
@@ -1045,19 +825,15 @@ function renderConfigureHtml(baseUrl) {
 </html>`;
 }
 
-// Разбор extraArgs вида "genre=Комедия&skip=20"
 function parseExtraArgs(extraSegment) {
   if (!extraSegment) return {};
   const clean = extraSegment.replace(/\.json$/i, '');
   const params = new URLSearchParams(clean);
   const out = {};
-  for (const [k, v] of params.entries()) {
-    out[k] = v;
-  }
+  for (const [k, v] of params.entries()) out[k.trim()] = v;
   return out;
 }
 
-// HTTP-сервер с полной поддержкой CORS для Nuvio и Stremio
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -1076,62 +852,71 @@ const server = http.createServer(async (req, res) => {
   const pathname = parsedUrl.pathname;
 
   try {
-    // 1. Встроенный прокси изображений (/proxy/image?url=...)
+    // 1. Серверный прокси обложек (/proxy/image?url=...) — скачивает картинку с TMDB или через wsrv.nl и отдает бинарным потоком
     if (pathname === '/proxy/image') {
       const targetUrl = parsedUrl.searchParams.get('url');
       if (!targetUrl) {
-        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Missing url parameter');
+        res.writeHead(400);
+        res.end('Missing url');
         return;
       }
-      // Перенаправляем на незаблокированный в РФ кеширующий CDN wsrv.nl
+      try {
+        // Сначала пробуем скачать напрямую с сервера (идеально при хостинге на Render), при неудаче — через wsrv.nl
+        let imgRes = await fetch(targetUrl, { headers: { 'User-Agent': 'NuvioRuTmdbAddon/2.0' } }).catch(() => null);
+        if (!imgRes || !imgRes.ok) {
+          imgRes = await fetch(`https://wsrv.nl/?url=${encodeURIComponent(targetUrl)}`);
+        }
+        if (imgRes && imgRes.ok) {
+          const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+          const buf = Buffer.from(await imgRes.arrayBuffer());
+          res.writeHead(200, {
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=86400'
+          });
+          res.end(buf);
+          return;
+        }
+      } catch (_) {}
       res.writeHead(302, { Location: `https://wsrv.nl/?url=${encodeURIComponent(targetUrl)}` });
       res.end();
       return;
     }
 
-    // 2. Страница настройки (/ и /configure)
+    // 2. Русский веб-конфигуратор
     if (pathname === '/' || pathname === '/configure' || pathname.endsWith('/configure')) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(renderConfigureHtml(baseUrl));
       return;
     }
 
-    // Определяем, передан ли закодированный конфиг в первом сегменте URL: /{config}/manifest.json
     const segments = pathname.split('/').filter(Boolean);
     let config = parseConfig(null);
     let routeSegments = segments;
 
-    if (
-      segments.length >= 2 &&
-      !['catalog', 'meta', 'stream', 'subtitles'].includes(segments[0])
-    ) {
+    if (segments.length >= 2 && !['catalog', 'meta', 'stream', 'subtitles'].includes(segments[0])) {
       config = parseConfig(segments[0]);
       routeSegments = segments.slice(1);
     }
 
-    // 3. Эндпоинт /manifest.json
+    // 3. Манифест
     if (routeSegments.length === 1 && routeSegments[0] === 'manifest.json') {
-      const manifest = buildManifest(config, baseUrl);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(manifest, null, 2));
+      res.end(JSON.stringify(buildManifest(config), null, 2));
       return;
     }
 
-    // 4. Эндпоинт /catalog/{type}/{id}.json и /catalog/{type}/{id}/{extra}.json
+    // 4. Каталоги
     if (routeSegments[0] === 'catalog' && routeSegments.length >= 3) {
       const type = routeSegments[1];
       const rawCatalogId = routeSegments[2].replace(/\.json$/i, '');
-      const extraSegment = routeSegments[3] || '';
-      const extraArgs = parseExtraArgs(extraSegment);
-
+      const extraArgs = parseExtraArgs(routeSegments[3] || '');
       const result = await handleCatalog(type, rawCatalogId, extraArgs, config, baseUrl);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(result));
       return;
     }
 
-    // 5. Эндпоинт /meta/{type}/{id}.json
+    // 5. Метаданные фильма/сериала
     if (routeSegments[0] === 'meta' && routeSegments.length >= 3) {
       const type = routeSegments[1];
       const rawId = routeSegments[2].replace(/\.json$/i, '');
@@ -1151,11 +936,7 @@ const server = http.createServer(async (req, res) => {
 
 if (require.main === module) {
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`============================================================`);
-    console.log(`Nuvio RU: Сервер русских каталогов успешно запущен!`);
-    console.log(`Страница настройки: http://127.0.0.1:${PORT}/configure`);
-    console.log(`Ссылка на манифест: http://127.0.0.1:${PORT}/manifest.json`);
-    console.log(`============================================================`);
+    console.log(`Nuvio RU (TMDB + Shikimori) запущен: http://127.0.0.1:${PORT}/configure`);
   });
 }
 
